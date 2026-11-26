@@ -8,6 +8,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
 import type { WorkflowEvent } from '../../types/events';
 import type { WorkflowState } from '../../hooks/useWorkflowState';
+import { buildOfflineContext } from '../../utils/offlineDirector';
 
 interface AgentChatProps {
   project: any;
@@ -109,6 +110,11 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
     } catch {}
 
     const projectTitle = project?.title || currentState?.script_data?.title || 'CineForge Production';
+    const ctx = currentState.offline_context || buildOfflineContext(
+      currentState?.script_data?.global_narrative || projectTitle,
+      projectTitle,
+      parseInt(selectedDuration) || 60
+    );
 
     if (!approved) {
       setIsLoading(true);
@@ -147,32 +153,19 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
       setThinkingSteps(['Script approved by Director.', 'Character Agent analyzing cast requirements...', 'Generating persistent character visual memory sheets...']);
       setTimeout(() => {
         currentState.current_stage = 'character_agent';
+        currentState.character_version = 1;
         currentState.approval_states = { ...(currentState.approval_states || {}), script_approved: true, characters_approved: false };
-        currentState.characters = [
-          {
-            character_id: 'char_1',
-            name: 'Solaris',
-            role: 'Lead Protagonist',
-            visual_description: 'Stoic commander clad in armored cyber-mesh with glowing amber accents and sharp cinematic lighting.',
-            image_url: '/solaris.jpg'
-          },
-          {
-            character_id: 'char_2',
-            name: 'Malakor',
-            role: 'Antagonist',
-            visual_description: 'Shadow operative in high-tech carbon cloak with neural visor and dramatic rim light.',
-            image_url: '/malakor.jpg'
-          }
-        ];
+        currentState.characters = ctx.characters;
         try { localStorage.setItem(storageKey, JSON.stringify(currentState)); } catch {}
         setIsLoading(false);
         setThinkingExpanded(false);
         setApprovalStage('character');
         setApprovalPending(true);
+        const namesList = ctx.characters.map((c: any) => `**${c.name}**`).join(' & ');
         const replyMsg: Message = {
           _id: Date.now().toString(),
           role: 'assistant',
-          content: `🎭 **Stage 2 Complete: Character Continuity Sheets Generated!**\n\nI have created persistent visual profiles for **Solaris** & **Malakor**.\n\n👉 Check the **Characters (Review)** tab above, then click **Approve** below to proceed to **Voiceover & Acoustic Direction**!`,
+          content: `🎭 **Stage 2 Complete: Character Continuity Sheets Generated!**\n\nI have created persistent visual profiles for ${namesList} tailored to **${ctx.genre}**.\n\n👉 Check the **Characters (Review)** tab above, then click **Approve** below to proceed to **Voiceover & Acoustic Direction**!`,
           createdAt: new Date().toISOString()
         };
         setMessages(prev => [...prev, replyMsg]);
@@ -184,22 +177,7 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
       setTimeout(() => {
         currentState.current_stage = 'voiceover_agent';
         currentState.approval_states = { ...(currentState.approval_states || {}), characters_approved: true, voiceovers_approved: false };
-        currentState.voiceovers = [
-          {
-            shot_id: 'shot_1',
-            speaker: 'Narrator',
-            dialogue: `Every legend begins with a spark. This is the story of ${projectTitle}.`,
-            audio_url: '',
-            duration_seconds: 4.5
-          },
-          {
-            shot_id: 'shot_2',
-            speaker: 'Solaris',
-            dialogue: "There's no turning back now. We face what lies ahead.",
-            audio_url: '',
-            duration_seconds: 5.0
-          }
-        ];
+        currentState.voiceovers = ctx.voiceovers;
         try { localStorage.setItem(storageKey, JSON.stringify(currentState)); } catch {}
         setIsLoading(false);
         setThinkingExpanded(false);
@@ -208,7 +186,7 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
         const replyMsg: Message = {
           _id: Date.now().toString(),
           role: 'assistant',
-          content: `🎙️ **Stage 3 Complete: Voiceover & Dialogue Tracks Ready!**\n\nAll dialogue lines have been paced and calibrated to **-16.0 LUFS**.\n\n👉 Check the **Audio (Review)** tab above, then click **Approve** below to launch **Video Production & Final Edit**!`,
+          content: `🎙️ **Stage 3 Complete: Voiceover & Dialogue Tracks Ready!**\n\nAll ${ctx.voiceovers.length} dialogue lines have been paced and calibrated to **-16.0 LUFS**.\n\n👉 Check the **Audio (Review)** tab above, then click **Approve** below to launch **Video Production & Final Edit**!`,
           createdAt: new Date().toISOString()
         };
         setMessages(prev => [...prev, replyMsg]);
@@ -220,26 +198,9 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
       setTimeout(() => {
         currentState.current_stage = 'editor_agent';
         currentState.approval_states = { ...(currentState.approval_states || {}), voiceovers_approved: true, video_approved: true };
-        currentState.video_shots = [
-          {
-            shot_id: 'shot_1',
-            video_url: '/Card_1_Video.mp4',
-            thumbnail_url: '/solaris.jpg',
-            prompt: `Cinematic wide establishing shot for ${projectTitle}.`,
-            duration_seconds: 4.5,
-            status: 'completed'
-          },
-          {
-            shot_id: 'shot_2',
-            video_url: '/Card_2_Video.mp4',
-            thumbnail_url: '/malakor.jpg',
-            prompt: 'Low-angle heroic close-up in dramatic lighting.',
-            duration_seconds: 5.0,
-            status: 'completed'
-          }
-        ];
-        currentState.final_video_url = '/Card_1_Video.mp4';
-        currentState.final_film_url = '/Card_1_Video.mp4';
+        currentState.video_shots = ctx.videoShots;
+        currentState.final_video_url = ctx.videoShots[0]?.video_url || '/Card_1_Video.mp4';
+        currentState.final_film_url = ctx.videoShots[0]?.video_url || '/Card_1_Video.mp4';
         try { localStorage.setItem(storageKey, JSON.stringify(currentState)); } catch {}
         setIsLoading(false);
         setThinkingExpanded(false);
@@ -506,31 +467,20 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
         setIsLoading(false);
         setThinkingExpanded(false);
         const projectTitle = project?.title || userMessageContent;
+        const ctx = buildOfflineContext(
+          userMessageContent,
+          projectTitle,
+          parseInt(selectedDuration) || 60
+        );
         const stage1Workflow = {
           current_stage: 'script_agent',
           script_version: 1,
+          offline_context: ctx,
           script_data: {
-            title: projectTitle,
-            genre: 'Cinematic Narrative',
-            global_narrative: `A cinematic ${selectedDuration}s narrative exploring "${userMessageContent}", crafted with atmospheric camera movement, character continuity, and synchronized dialogue.`,
-            shots: [
-              {
-                shot_id: 'shot_1',
-                duration_seconds: 5,
-                camera_movement: 'Cinematic slow push-in tracking shot',
-                visual_description: `WIDE ESTABLISHING TRACKING SHOT — ${userMessageContent}. Ultra cinematic 8K, photorealistic atmospheric haze, volumetric lighting.`,
-                speaker: 'Narrator',
-                dialogue: `Every legend begins with a spark. This is the story of ${projectTitle}.`
-              },
-              {
-                shot_id: 'shot_2',
-                duration_seconds: 5,
-                camera_movement: 'Low-angle heroic wide shot',
-                visual_description: 'LOW-ANGLE HEROIC CLOSE-UP — Solaris stands resolute against a dramatic backdrop in volumetric amber lighting.',
-                speaker: 'Solaris',
-                dialogue: "There's no turning back now. We face what lies ahead."
-              }
-            ]
+            title: ctx.projectTitle,
+            genre: ctx.genre,
+            global_narrative: ctx.globalNarrative,
+            shots: ctx.shots
           },
           characters: [],
           voiceovers: [],
