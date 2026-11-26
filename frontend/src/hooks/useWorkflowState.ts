@@ -58,7 +58,22 @@ export interface WorkflowState {
   };
 }
 
-const DEMO_WORKFLOW_STATE: WorkflowState = {
+export const EMPTY_WORKFLOW_STATE: WorkflowState = {
+  current_stage: 'script_agent',
+  script_data: null,
+  characters: [],
+  voiceovers: [],
+  video_shots: [],
+  final_video_url: undefined,
+  approval_states: {
+    script_approved: false,
+    characters_approved: false,
+    voiceovers_approved: false,
+    video_approved: false
+  }
+};
+
+export const DEMO_PRE_RENDERED_STATE: WorkflowState = {
   current_stage: 'editor_agent',
   script_data: {
     title: 'Neon Odyssey: Chronicles of Neo-Kyoto',
@@ -165,15 +180,34 @@ export function useWorkflowState(projectId: string | undefined) {
       if (res.data && res.data.script_data) {
         setWorkflowState(res.data);
       } else {
-        setWorkflowState(DEMO_WORKFLOW_STATE);
+        loadFallback();
       }
-    } catch (error) {
-      console.warn('Backend unavailable, using demo studio state:', error);
-      setWorkflowState(DEMO_WORKFLOW_STATE);
+    } catch {
+      loadFallback();
     } finally {
       setIsLoading(false);
     }
   }, [projectId]);
+
+  const loadFallback = () => {
+    if (!projectId) return;
+    // Check local storage for this project's workflow state
+    try {
+      const stored = localStorage.getItem('cineforge_workflow_' + projectId);
+      if (stored) {
+        setWorkflowState(JSON.parse(stored));
+        return;
+      }
+    } catch {}
+
+    // Only demo-1 and demo-2 default to pre-rendered complete state
+    if (projectId === 'demo-1' || projectId === 'demo-2') {
+      setWorkflowState(DEMO_PRE_RENDERED_STATE);
+    } else {
+      // Any new project starts clean: only chat, no generated assets yet
+      setWorkflowState(EMPTY_WORKFLOW_STATE);
+    }
+  };
 
   useEffect(() => {
     fetchState();

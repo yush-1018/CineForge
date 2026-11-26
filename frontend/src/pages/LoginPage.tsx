@@ -80,16 +80,19 @@ export default function LoginPage() {
         }
       }
 
-      setError(strings.login.loginFailed);
+      loginAsGuest();
+      navigate('/dashboard', { replace: true });
     } catch (err: any) {
       console.error('Login process failed:', err);
-      setError(strings.login.loginFailed);
+      loginAsGuest();
+      navigate('/dashboard', { replace: true });
     }
   };
 
   const handleError = () => {
     console.error('Google Login Failed');
-    setError(strings.login.googleLoginFailed);
+    loginAsGuest();
+    navigate('/dashboard', { replace: true });
   };
 
   return (
