@@ -2,12 +2,14 @@
 Unit tests for CineForge media processor and video pipeline.
 Tests Section 6 of CineForge Fix Spec.
 """
-import os
-import subprocess
+import asyncio
+import math
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 import pytest
+from fastapi import HTTPException
 
-from core.config import settings
+from core.config import settings, validate_safe_id, resolve_confined_path
 from core.media_processor import (
     probe,
     normalize_clip,
@@ -19,28 +21,39 @@ from core.media_processor import (
     compute_shot_duration,
     format_ass_time,
     estimate_word_timings,
+    verify_film,
     create_shot_subtitles_ass,
     generate_title_card,
     generate_credits_card,
     MediaProcessingError,
     ShotTooShortError,
     DurationMismatchError,
-    FFMPEG_BIN,
     FFPROBE_BIN,
+    _escape_ffmpeg_filter_path,
     _ff,
     _run
 )
-import math
-from agents.graph import validate_and_split_dialogue, PROVIDER_CLIP_SECONDS
+from agents.graph import (
+    validate_and_split_dialogue,
+    _normalize_script_shots,
+    match_role_override_rule,
+    PROVIDER_CLIP_SECONDS,
+)
+from agents.editor_agent import assemble_video
+from api.routes.workflow import RespondApprovalRequest, respond_approval, save_persisted_state
+from core.events import WorkflowEventEmitter, respond_to_approval
 from core.media_validator import (
     MediaValidator,
-    detect_black_bars,
     detect_freezes,
     detect_shot_loops,
     detect_duplicate_shots
 )
-from core.providers import VoiceStudioAudioAdapter, get_audio_provider
-from core.video_generator import QuotaExceededError
+from core.providers import (
+    EdgeTTSAudioAdapter,
+    ElevenLabsAudioAdapter,
+    VoiceStudioAudioAdapter,
+)
+from core.video_generator import QuotaExceededError, generate_ai_video_clip
 
 
 @pytest.fixture
@@ -345,20 +358,54 @@ def test_shot_count_math_and_dialogue_splitting():
     # 1. Shot count math: ceil(duration / PROVIDER_CLIP_SECONDS)
     target_duration = 60.0
     expected_shots = math.ceil(target_duration / PROVIDER_CLIP_SECONDS)
-    assert expected_shots == math.ceil(60.0 / 8.0) == 8
+    assert expected_shots == math.ceil(60.0 / settings.PROVIDER_CLIP_SECONDS)
 
-    # 2. Dialogue splitting check: max ~2.5 words per second
+    # 2. Dialogue splitting check: preserves every word token in exact order
     shots = [
-        {"shot_id": "shot_1", "duration_seconds": 4.0, "dialogue": "One two three four five six seven eight nine ten eleven twelve thirteen fourteen", "speaker": "Alex"},
-        {"shot_id": "shot_2", "duration_seconds": 4.0, "dialogue": "", "speaker": "Alex"}
+        {"shot_id": "shot_1", "duration_seconds": 6.0, "dialogue": "One two three four five six seven eight nine ten eleven twelve thirteen fourteen", "speaker": "Alex"},
+        {"shot_id": "shot_2", "duration_seconds": 6.0, "dialogue": "", "speaker": "Alex"}
     ]
+    orig_tokens = " ".join(s["dialogue"] for s in shots).split()
     split_shots = validate_and_split_dialogue(shots, max_wps=2.5)
-    # 4.0s * 2.5 = 10 words max in shot_1
+    # (6.0 - 2.0) * 2.5 = 10 words max in shot_1
     words_s1 = split_shots[0]["dialogue"].split()
     assert len(words_s1) <= 10
-    # Remaining overflow should be transferred to shot_2
     words_s2 = split_shots[1]["dialogue"].split()
     assert len(words_s2) > 0
+    assert words_s1 + words_s2 == orig_tokens
+
+    # 3. 1s shot leaves 0 speech budget (no 3-word floor) and raises on overflow
+    with pytest.raises(ValueError):
+        validate_and_split_dialogue(
+            [{"shot_id": "shot_1", "duration_seconds": 1.0, "dialogue": "Three short words", "speaker": "Alex"}],
+            max_wps=2.5,
+        )
+
+    # 4. Fractional duration redistribution borrows from earlier shots instead of inflating final shot > target
+    balanced = _normalize_script_shots(
+        [
+            {"shot_id": "shot_1", "duration_seconds": settings.PROVIDER_CLIP_SECONDS},
+            {"shot_id": "shot_2", "duration_seconds": settings.PROVIDER_CLIP_SECONDS},
+        ],
+        duration=min(8.5, settings.PROVIDER_CLIP_SECONDS + 0.5),
+    )
+    target_frac = min(8.5, settings.PROVIDER_CLIP_SECONDS + 0.5)
+    assert abs(sum(s["duration_seconds"] for s in balanced) - target_frac) <= 0.2
+    assert all(1.0 <= s["duration_seconds"] <= settings.PROVIDER_CLIP_SECONDS for s in balanced)
+
+    # 5. Speaker change or final-shot overflow must raise ValueError instead of dropping dialogue
+    cross_speaker = [
+        {"shot_id": "shot_1", "duration_seconds": 4.0, "dialogue": " ".join([f"w{i}" for i in range(15)]), "speaker": "Alex"},
+        {"shot_id": "shot_2", "duration_seconds": 4.0, "dialogue": "", "speaker": "Bob"}
+    ]
+    with pytest.raises(ValueError):
+        validate_and_split_dialogue(cross_speaker, max_wps=2.5)
+
+    last_shot_overflow = [
+        {"shot_id": "shot_1", "duration_seconds": 4.0, "dialogue": " ".join([f"w{i}" for i in range(15)]), "speaker": "Alex"}
+    ]
+    with pytest.raises(ValueError):
+        validate_and_split_dialogue(last_shot_overflow, max_wps=2.5)
 
 
 def test_build_normalize_cmd():
@@ -439,3 +486,200 @@ def test_media_validator_detects_loops(tmp_path):
 
     loops = detect_shot_loops(looped, min_offset=2, max_offset=4, diff_threshold=3.0)
     assert len(loops) > 0
+
+
+def test_ass_text_escaping(tmp_path):
+    sub_file = tmp_path / "escaped.ass"
+    create_shot_subtitles_ass(
+        dialogue=r"Look {at}\nthis",
+        speaker="A{lex}",
+        duration=5.0,
+        out_path=sub_file
+    )
+    content = sub_file.read_text(encoding="utf-8")
+    assert r"\{at\}" in content
+    assert r"A\{LEX\}:" in content
+
+
+def test_slowmo_limit_raises_shot_too_short(tmp_path, make_test_video):
+    src = tmp_path / "clip4.mp4"
+    dst = tmp_path / "out.mp4"
+    make_test_video(src, duration=4.0)
+    # 4.0s * 1.25 = 5.0s max; requesting 5.5s exceeds MAX_SLOWMO_FACTOR even though diff is 1.5s
+    with pytest.raises(ShotTooShortError):
+        normalize_clip(src, dst, duration=5.5)
+
+
+def test_mux_shot_and_verify_film_freeze_failure(tmp_path, make_test_audio):
+    frozen_vid = tmp_path / "frozen_master.mp4"
+    _run(_ff(
+        "-f", "lavfi",
+        "-i", "color=c=black:s=1280x720:d=3.0:r=24",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
+        str(frozen_vid)
+    ))
+    aud = tmp_path / "aud.mp3"
+    make_test_audio(aud, duration=2.0)
+    muxed = tmp_path / "muxed_master.mp4"
+    mux_shot(frozen_vid, aud, muxed, duration=3.0)
+    assert muxed.exists()
+
+    qc = verify_film(muxed)
+    assert qc["checks"]["freezes"]["passed"] is False
+    assert qc["passed"] is False
+
+
+def test_duplicate_shots_and_validate_film(tmp_path, make_test_video, make_test_audio):
+    shot_a = tmp_path / "shot_a.mp4"
+    make_test_video(shot_a, duration=3.0, fps=24, width=1280, height=720)
+    # Passing identical shot path twice must be detected as duplicate, not collapsed by path key
+    dups = detect_duplicate_shots([shot_a, shot_a], diff_threshold=3.0)
+    assert len(dups) == 1
+
+    aud = tmp_path / "aud.mp3"
+    make_test_audio(aud, duration=2.0)
+    master = tmp_path / "master.mp4"
+    mux_shot(shot_a, aud, master, duration=3.0)
+
+    validator = MediaValidator(target_width=1280, target_height=720, target_fps=24, duration_tolerance=0.2)
+    res = validator.validate_film(master, expected_duration=3.0, shot_paths=[shot_a], title_card_duration=0.0, credits_card_duration=0.0)
+    assert res.passed is True
+
+
+
+def test_filter_path_escaping_with_commas(tmp_path):
+    comma_dir = tmp_path / "dir,with,commas"
+    comma_dir.mkdir(parents=True, exist_ok=True)
+    escaped = _escape_ffmpeg_filter_path(comma_dir / "title[1].ass")
+    assert r"\," in escaped
+    assert r"\[" in escaped and r"\]" in escaped
+
+    card = generate_title_card("Cine, Forge", "Test, Subtitle", duration=1.5, dst_path=comma_dir / "title.mp4")
+    assert card.exists()
+    assert probe(card).has_video is True
+
+
+def test_mux_shot_missing_audio_path_raises(tmp_path, make_test_video):
+    vid = tmp_path / "v.mp4"
+    make_test_video(vid, duration=2.0, fps=24, width=1280, height=720)
+    with pytest.raises(FileNotFoundError):
+        mux_shot(vid, tmp_path / "does_not_exist.mp3", tmp_path / "out.mp4", duration=2.0)
+
+    silent_out = tmp_path / "silent.mp4"
+    mux_shot(vid, None, silent_out, duration=2.0)
+    assert silent_out.exists()
+    assert probe(silent_out).has_audio is True
+
+
+def test_role_override_word_boundaries():
+    assert match_role_override_rule("Lauren") is None
+    matched = match_role_override_rule("Ren Vance")
+    assert matched is not None
+    assert matched["voice"] == "en-US-ChristopherNeural"
+
+
+def test_audio_provider_isolation_and_neutral_presets():
+    vs = VoiceStudioAudioAdapter()
+    sarah_cfg = vs.match_character_voice("Sarah", gender="female")
+    assert sarah_cfg["fallback_voice"].endswith("Neural")
+    assert sarah_cfg["gender"] == "female"
+
+    # ElevenLabs invalidation must be scoped per API key
+    key_bad = "el-invalid-key-123456"
+    key_good = "el-valid-key-789012"
+    ElevenLabsAudioAdapter._invalid_key_hashes.add(ElevenLabsAudioAdapter._key_hash(key_bad))
+    assert ElevenLabsAudioAdapter._key_hash(key_bad) in ElevenLabsAudioAdapter._invalid_key_hashes
+    assert ElevenLabsAudioAdapter._key_hash(key_good) not in ElevenLabsAudioAdapter._invalid_key_hashes
+    ElevenLabsAudioAdapter._invalid_key_hashes.discard(ElevenLabsAudioAdapter._key_hash(key_bad))
+
+    # EdgeTTS must preserve neutral +0Hz/+0% when explicit neutral preset requested
+    captured = {}
+
+    class FakeComm:
+        def __init__(self, text, voice, pitch="+0Hz", rate="+0%"):
+            captured.update({"text": text, "voice": voice, "pitch": pitch, "rate": rate})
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"mp3data"}
+
+    edge = EdgeTTSAudioAdapter()
+    with patch("edge_tts.Communicate", FakeComm):
+        out_uri = asyncio.run(edge.generate_speech("Hello world", voice_id="normal_adult_male"))
+    assert out_uri.startswith("data:audio/mp3;base64,")
+    assert captured["voice"] == "en-US-ChristopherNeural"
+    assert captured["pitch"] == "+0Hz"
+    assert captured["rate"] == "+0%"
+
+
+def test_video_generator_non_quota_error(tmp_path):
+    img = tmp_path / "frame.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 2048)
+
+    bad_client = MagicMock()
+    bad_client.endpoints = {}
+    bad_client.predict.side_effect = ValueError("Invalid argument: steps")
+
+    with patch("gradio_client.Client", return_value=bad_client), patch("gradio_client.handle_file", side_effect=lambda p: p):
+        with pytest.raises(RuntimeError) as exc_info:
+            generate_ai_video_clip(str(img), "test prompt", hf_token="tok", duration=4.0)
+    assert not isinstance(exc_info.value, QuotaExceededError)
+
+
+def test_stage_bound_approvals_and_path_confinement(tmp_path):
+    with pytest.raises(ValueError):
+        validate_safe_id("../evil", "project_id")
+    with pytest.raises(ValueError):
+        resolve_confined_path(tmp_path, "..", "escape.txt")
+
+    # Stage isolation in WorkflowEventEmitter
+    async def _check_events():
+        pid = f"evt_{tmp_path.name}"
+        emitter = WorkflowEventEmitter(pid)
+        task = asyncio.create_task(emitter.wait_for_approval("characters"))
+        await asyncio.sleep(0.01)
+        respond_to_approval(pid, True, stage="script")
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        respond_to_approval(pid, True, stage="characters")
+        res = await asyncio.wait_for(task, timeout=1.0)
+        assert res["approved"] is True
+
+    asyncio.run(_check_events())
+
+    # Mismatched stage returns 409 Conflict; failed save raises HTTP 500 when requested
+    test_pid = "test_proj_stage_guard"
+    from api.routes.workflow import load_persisted_state, _memory_store, _dirty_projects, _get_cache_path
+    state = {
+        "project_id": test_pid,
+        "script_data": {"shots": [{"shot_id": "shot_1", "duration_seconds": 5.0}]},
+        "characters": [{"id": "char_1", "name": "Alex"}],
+        "approval_states": {"script_approved": True, "characters_approved": False},
+        "messages": [],
+    }
+    cache_file = Path(_get_cache_path(test_pid))
+    try:
+        save_persisted_state(test_pid, state, raise_on_error=True)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(respond_approval(RespondApprovalRequest(project_id=test_pid, approved=True, stage="script")))
+        assert exc.value.status_code == 409
+
+        state["character_version"] = 99
+        with patch("builtins.open", side_effect=OSError("disk full")):
+            with pytest.raises(HTTPException) as save_exc:
+                save_persisted_state(test_pid, state, raise_on_error=True)
+        assert save_exc.value.status_code == 500
+        loaded = load_persisted_state(test_pid)
+        assert loaded is not None and loaded.get("character_version") == 99
+
+        with pytest.raises(ValueError):
+            asyncio.run(
+                assemble_video(
+                    {"project_id": test_pid, "script_data": {"shots": [{"shot_id": "../evil"}]}},
+                    {"configurable": {}},
+                )
+            )
+    finally:
+        _memory_store.pop(test_pid, None)
+        _dirty_projects.discard(test_pid)
+        if cache_file.exists():
+            cache_file.unlink()

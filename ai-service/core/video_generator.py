@@ -1,8 +1,10 @@
 import os
 import time
+import hashlib
 import logging
 import random
-from typing import Optional, List, Dict
+import threading
+from typing import Optional, List, Dict, Set
 
 from core.config import settings
 
@@ -21,20 +23,28 @@ CANDIDATE_VIDEO_SPACES: List[str] = [
     "cbensimon/wan2-2-fp8da-aoti-preview2",
 ]
 
-# Track per-space cooldowns so an exhausted space doesn't block other spaces
+# Thread-safe tracking for per-space cooldowns and per-token quota state
+_state_lock = threading.Lock()
 _space_cooldowns: Dict[str, float] = {}
-_token_quota_exhausted: bool = False  # Set to False when fresh HF token is provided
+_exhausted_token_hashes: Set[str] = set()
+
+def _token_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
 def record_space_cooldown(space_id: str, seconds: float = 120.0) -> None:
-    _space_cooldowns[space_id] = time.time() + seconds
+    with _state_lock:
+        _space_cooldowns[space_id] = time.time() + seconds
     logger.info(f"Recorded cooldown for video space '{space_id}' ({seconds:.0f}s).")
 
 def is_space_available(space_id: str) -> bool:
-    return time.time() >= _space_cooldowns.get(space_id, 0.0)
+    with _state_lock:
+        return time.time() >= _space_cooldowns.get(space_id, 0.0)
 
 def record_quota_exhaustion(seconds: float = 120.0):
-    for space in CANDIDATE_VIDEO_SPACES:
-        _space_cooldowns[space] = time.time() + seconds
+    with _state_lock:
+        expiry = time.time() + seconds
+        for space in CANDIDATE_VIDEO_SPACES:
+            _space_cooldowns[space] = expiry
 
 def is_quota_exhausted() -> bool:
     return all(not is_space_available(s) for s in CANDIDATE_VIDEO_SPACES)
@@ -73,8 +83,6 @@ def generate_ai_video_clip(
     Wan 2.2 Image-to-Video across a resilient pool of ZeroGPU spaces with automatic failover.
     Ensures continuous motion without freezing or static holds.
     """
-    global _token_quota_exhausted
-
     if not os.path.exists(image_path):
         logger.warning(f"Image not found at {image_path}")
         return None
@@ -82,12 +90,12 @@ def generate_ai_video_clip(
     # Filter spaces that are not on cooldown
     available_spaces = [s for s in CANDIDATE_VIDEO_SPACES if is_space_available(s)]
     if not available_spaces:
-        # Check minimum remaining cooldown
-        remaining = int(min((_space_cooldowns.get(s, 0.0) - time.time()) for s in CANDIDATE_VIDEO_SPACES))
+        with _state_lock:
+            remaining = int(min((_space_cooldowns.get(s, 0.0) - time.time()) for s in CANDIDATE_VIDEO_SPACES))
         remaining = max(1, remaining)
         raise QuotaExceededError(f"All ZeroGPU video spaces are on cooldown ({remaining}s remaining).")
 
-    clip_duration = float(duration if duration is not None else settings.PROVIDER_CLIP_DURATION_SEC)
+    clip_duration = float(duration if duration is not None else settings.PROVIDER_CLIP_SECONDS)
     raw_token = hf_token or os.getenv("HUGGINGFACE_API_KEY", "") or getattr(settings, "HUGGINGFACE_API_KEY", "")
 
     from gradio_client import Client, handle_file
@@ -105,9 +113,13 @@ def generate_ai_video_clip(
 
     seed_val = random.randint(1000, 999999)
     last_error = None
+    saw_quota_or_busy = False
+    token_hash = _token_key(raw_token) if raw_token else None
 
     for space_id in available_spaces:
-        token_attempts = [raw_token, None] if (raw_token and not _token_quota_exhausted) else [None]
+        with _state_lock:
+            token_exhausted = bool(token_hash and token_hash in _exhausted_token_hashes)
+        token_attempts = [raw_token, None] if (raw_token and not token_exhausted) else [None]
 
         for token_val in token_attempts:
             auth_label = "with token" if token_val else "anonymous"
@@ -115,8 +127,12 @@ def generate_ai_video_clip(
             try:
                 try:
                     client = Client(space_id, token=token_val)
-                except Exception:
-                    client = Client(space_id)
+                except Exception as client_err:
+                    err_lower = str(client_err).lower()
+                    if token_val and any(k in err_lower for k in ("401", "403", "token", "auth", "quota")):
+                        client = Client(space_id)
+                    else:
+                        raise
 
                 # Introspect endpoint parameter names so we pass the exact signature needed
                 ep = next((e for e in client.endpoints.values() if e.api_name == "/generate_video"), None)
@@ -161,8 +177,10 @@ def generate_ai_video_clip(
                 last_error = err
 
                 if "exceeded your free zerogpu quota" in err_str or "quota" in err_str:
-                    if token_val:
-                        _token_quota_exhausted = True
+                    saw_quota_or_busy = True
+                    if token_val and token_hash:
+                        with _state_lock:
+                            _exhausted_token_hashes.add(token_hash)
                         logger.warning(f"User HF token exhausted quota on '{space_id}'. Retrying space immediately as anonymous...")
                         continue  # Try next iteration with token_val=None
 
@@ -171,6 +189,7 @@ def generate_ai_video_clip(
                     "rate limit", "exceeded", "timeout", "timed out", "504", "502"
                 ]) and not any(w in err_str for w in ["argument", "parameter", "keyword"])
                 if is_quota_or_busy:
+                    saw_quota_or_busy = True
                     record_space_cooldown(space_id, 120.0)
                     logger.warning(f"Space '{space_id}' unavailable/quota exceeded ({err}). Trying next candidate space...")
                 else:
@@ -178,5 +197,7 @@ def generate_ai_video_clip(
                 break  # Move to next space
 
     err_details = f": {last_error}" if last_error else ""
-    raise QuotaExceededError(f"All candidate ZeroGPU spaces failed or exhausted{err_details}")
+    if saw_quota_or_busy:
+        raise QuotaExceededError(f"All candidate ZeroGPU spaces failed or exhausted{err_details}")
+    raise RuntimeError(f"Video generation failed across candidate spaces{err_details}")
 

@@ -4,7 +4,6 @@ All FFmpeg / ffprobe access lives here. Argument lists only, no shell.
 import os
 import json
 import logging
-import math
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -159,6 +158,32 @@ def format_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def _escape_ass_text(text: str) -> str:
+    """Escape ASS override braces, backslashes, and line breaks."""
+    return (
+        (text or "")
+        .replace("\\", r"\\")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("\r\n", " ")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
+
+
+def _escape_ffmpeg_filter_path(path: Path | str) -> str:
+    """Escape special FFmpeg filtergraph characters in a filesystem path (e.g. for ass=...)."""
+    raw = Path(path).resolve().as_posix()
+    return (
+        raw.replace("\\", r"\\")
+        .replace(":", r"\:")
+        .replace(",", r"\,")
+        .replace("'", r"\'")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+    )
+
+
 def estimate_word_timings(
     dialogue: str,
     total_audio_duration: float,
@@ -223,7 +248,7 @@ def create_shot_subtitles_ass(
         )
         return out_p
 
-    speaker_tag = f"{speaker.strip().upper()}: " if speaker and speaker.strip() else ""
+    speaker_tag = f"{_escape_ass_text(speaker.strip().upper())}: " if speaker and speaker.strip() else ""
 
     pre_delay = settings.SHOT_PRE_DELAY_SEC
     effective_audio_dur = audio_duration or (duration - pre_delay - settings.SHOT_POST_TAIL_SEC)
@@ -240,7 +265,7 @@ def create_shot_subtitles_ass(
 
     karaoke_parts = []
     for wt in word_timings:
-        word = wt.get("word", "")
+        word = _escape_ass_text(wt.get("word", ""))
         cs = wt.get("duration_cs", 30)
         karaoke_parts.append(f"{{\\kf{cs}}}{word} ")
     animated_text = "".join(karaoke_parts).strip()
@@ -288,8 +313,8 @@ def generate_title_card(
     w, h, fps = settings.VIDEO_WIDTH, settings.VIDEO_HEIGHT, settings.VIDEO_FPS
     ass_path = dst_p.with_suffix(".ass")
 
-    clean_title = (title or "CineForge Original").upper().strip()
-    clean_sub = (subtitle or "A CineForge Original Production").strip()
+    clean_title = _escape_ass_text((title or "CineForge Original").upper().strip())
+    clean_sub = _escape_ass_text((subtitle or "A CineForge Original Production").strip())
 
     ass_content = f"""[Script Info]
 Title: CineForge Title Card
@@ -312,7 +337,7 @@ Dialogue: 0,0:00:00.50,{format_ass_time(dur - 0.3)},Title,,0,0,0,,{{\\c&H004ED1F
 Dialogue: 0,0:00:00.70,{format_ass_time(dur - 0.3)},Subtitle,,0,0,-120,,{clean_sub}
 """
     ass_path.write_text(ass_content, encoding="utf-8")
-    escaped_ass = ass_path.resolve().as_posix().replace(":", "\\\\:")
+    escaped_ass = _escape_ffmpeg_filter_path(ass_path)
 
     fade_out_start = max(0.5, dur - 0.5)
     vf = f"ass={escaped_ass},fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start:.2f}:d=0.5"
@@ -362,7 +387,7 @@ def generate_credits_card(
 
     starring_line = ""
     if characters:
-        valid_chars = [c.strip() for c in characters if c and c.strip()]
+        valid_chars = [_escape_ass_text(c.strip()) for c in characters if c and c.strip()]
         if valid_chars:
             if len(valid_chars) == 1:
                 starring_line = f"Starring {valid_chars[0]}"
@@ -394,7 +419,7 @@ Dialogue: 0,0:00:00.50,{format_ass_time(dur - 0.3)},Cast,,0,0,0,,{starring_line}
 Dialogue: 0,0:00:00.70,{format_ass_time(dur - 0.3)},Studio,,0,0,-100,,Created with CineForge Studio
 """
     ass_path.write_text(ass_content, encoding="utf-8")
-    escaped_ass = ass_path.resolve().as_posix().replace(":", "\\\\:")
+    escaped_ass = _escape_ffmpeg_filter_path(ass_path)
 
     fade_out_start = max(0.5, dur - 0.5)
     vf = f"ass={escaped_ass},fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start:.2f}:d=0.5"
@@ -463,10 +488,10 @@ def build_normalize_cmd(
         filter_complex = (
             f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=20:5[bg];"
             f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps={fps},setsar=1,setpts={setpts_expr}"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts={setpts_expr},fps={fps},setsar=1"
         )
         if subtitle_file and os.path.exists(str(subtitle_file)):
-            sub_path = Path(subtitle_file).resolve().as_posix().replace(":", "\\\\:")
+            sub_path = _escape_ffmpeg_filter_path(subtitle_file)
             filter_complex += f",ass={sub_path}"
         filter_complex += "[v]"
 
@@ -476,16 +501,18 @@ def build_normalize_cmd(
             "-filter_complex", filter_complex,
             "-map", "[v]"
         ]
+        if include_audio:
+            cmd += ["-map", "0:a?"]
     else:
         vf_filters = [
             f"scale={w}:{h}:force_original_aspect_ratio=increase",
             f"crop={w}:{h}",
+            f"setpts={setpts_expr}",
             f"fps={fps}",
-            "setsar=1",
-            f"setpts={setpts_expr}"
+            "setsar=1"
         ]
         if subtitle_file and os.path.exists(str(subtitle_file)):
-            sub_path = Path(subtitle_file).resolve().as_posix().replace(":", "\\\\:")
+            sub_path = _escape_ffmpeg_filter_path(subtitle_file)
             vf_filters.append(f"ass={sub_path}")
 
         cmd = [
@@ -549,11 +576,12 @@ def normalize_clip(
 
     target_duration = float(duration) if duration is not None else float(info.duration)
     short_by = target_duration - info.duration
+    min_required_src = target_duration / settings.MAX_SLOWMO_FACTOR
 
-    # If shorter by more than 1.5s (beyond max 1.25x slowmo range), raise error
-    if short_by > 1.5:
+    # If shorter than slow-mo limit allows, raise error
+    if short_by > 1.5 or info.duration < (min_required_src - 0.01):
         raise ShotTooShortError(
-            f"clip is {info.duration:.2f}s but shot needs {target_duration:.2f}s (short by {short_by:.2f}s > 1.5s). Looping and padding are disabled."
+            f"clip is {info.duration:.2f}s but shot needs {target_duration:.2f}s (min {min_required_src:.2f}s at {settings.MAX_SLOWMO_FACTOR}x slow-mo). Looping and padding are disabled."
         )
 
     # Detect if aspect ratio is portrait (< 1.0) or non-widescreen (< 1.6)
@@ -597,8 +625,10 @@ def mux_shot(
     vid_dur = duration if duration is not None else v_info.duration
     sr = settings.AUDIO_SAMPLE_RATE
 
-    if audio_path and os.path.exists(str(audio_path)):
+    if audio_path:
         a_path = Path(audio_path).resolve()
+        if not a_path.exists():
+            raise FileNotFoundError(f"Voiceover audio file not found: {a_path}")
         ms = int(settings.SHOT_PRE_DELAY_SEC * 1000)
         af = (
             f"aresample={sr},aformat=channel_layouts=stereo,"
@@ -721,20 +751,23 @@ def build_audio_track(
             "-f", "null", "-"
         ]
         p1 = subprocess.run(pass1_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=settings.FFMPEG_TIMEOUT_SEC)
+        if p1.returncode != 0:
+            raise MediaProcessingError(f"Audio track loudness pass1 failed (exit {p1.returncode}): {p1.stderr[-400:]}")
         json_match = re.search(r"\{[\s\S]*?\"input_i\"[\s\S]*?\}", p1.stderr)
-        if json_match:
-            stats = json.loads(json_match.group(0))
-            input_i = str(stats.get("input_i", "-inf")).strip()
-            if input_i != "-inf" and float(input_i) > -65.0:
-                af2 = (
-                    f"loudnorm=I={settings.TARGET_LUFS}:TP={settings.TARGET_TRUE_PEAK}:LRA=11:"
-                    f"measured_I={stats['input_i']}:measured_TP={stats['input_tp']}:"
-                    f"measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}:"
-                    f"offset={stats['target_offset']}:linear=true,aresample={sr}"
-                )
-                _run(_ff("-i", str(raw_concat_path), "-af", af2, "-ar", str(sr), "-ac", "2", str(dst_path)))
-                return
-        # Fallback if track is completely silent or measurement unavailable
+        if not json_match:
+            raise MediaProcessingError(f"Audio track loudness pass1 produced no statistics: {p1.stderr[-400:]}")
+        stats = json.loads(json_match.group(0))
+        input_i = str(stats.get("input_i", "-inf")).strip()
+        if input_i != "-inf" and float(input_i) > -65.0:
+            af2 = (
+                f"loudnorm=I={settings.TARGET_LUFS}:TP={settings.TARGET_TRUE_PEAK}:LRA=11:"
+                f"measured_I={stats['input_i']}:measured_TP={stats['input_tp']}:"
+                f"measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}:"
+                f"offset={stats['target_offset']}:linear=true,aresample={sr}"
+            )
+            _run(_ff("-i", str(raw_concat_path), "-af", af2, "-ar", str(sr), "-ac", "2", str(dst_path)))
+            return
+        # Fallback only when confirmed silent audio track (-inf or <= -65 LUFS)
         shutil.move(str(raw_concat_path), str(dst_path))
     finally:
         if raw_concat_path.exists():
@@ -742,6 +775,49 @@ def build_audio_track(
                 raw_concat_path.unlink()
             except Exception:
                 pass
+
+
+def normalize_master_loudness(src: Path | str, dst: Path | str) -> None:
+    """Two-pass EBU R128 loudness normalization (-16 LUFS) on a muxed video while copying video."""
+    import re
+    src_path = Path(src).resolve()
+    dst_path = Path(dst).resolve()
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    sr = settings.AUDIO_SAMPLE_RATE
+
+    pass1_cmd = [
+        FFMPEG_BIN, "-hide_banner", "-i", str(src_path),
+        "-vn", "-af", f"loudnorm=I={settings.TARGET_LUFS}:TP={settings.TARGET_TRUE_PEAK}:LRA=11:print_format=json",
+        "-f", "null", "-"
+    ]
+    p1 = subprocess.run(pass1_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=settings.FFMPEG_TIMEOUT_SEC)
+    if p1.returncode != 0:
+        raise MediaProcessingError(f"Master loudness pass1 failed (exit {p1.returncode}): {p1.stderr[-400:]}")
+    json_match = re.search(r"\{[\s\S]*?\"input_i\"[\s\S]*?\}", p1.stderr)
+    if not json_match:
+        raise MediaProcessingError(f"Master loudness pass1 produced no statistics: {p1.stderr[-400:]}")
+    stats = json.loads(json_match.group(0))
+    input_i = str(stats.get("input_i", "-inf")).strip()
+    if input_i != "-inf" and float(input_i) > -65.0:
+        af2 = (
+            f"loudnorm=I={settings.TARGET_LUFS}:TP={settings.TARGET_TRUE_PEAK}:LRA=11:"
+            f"measured_I={stats['input_i']}:measured_TP={stats['input_tp']}:"
+            f"measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}:"
+            f"offset={stats['target_offset']}:linear=true,aresample={sr}"
+        )
+        _run(_ff(
+            "-i", str(src_path),
+            "-c:v", "copy",
+            "-af", af2,
+            "-c:a", "aac",
+            "-b:a", settings.AUDIO_BITRATE,
+            "-ar", str(sr),
+            "-ac", "2",
+            "-movflags", "+faststart",
+            str(dst_path)
+        ))
+        return
+    shutil.copyfile(src_path, dst_path)
 
 
 def mux(video: Path | str, audio: Path | str, dst: Path | str) -> None:
@@ -918,12 +994,20 @@ def verify_film(master_path: Path | str) -> dict:
         "-vf", "freezedetect=n=-60dB:d=1.5", "-an", "-f", "null", "-"
     ]
     freeze_proc = subprocess.run(freeze_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
-    freezes = re.findall(r"freeze_start:\s+([-\d\.]+)", freeze_proc.stderr)
-    results["checks"]["freezes"] = {
-        "passed": len(freezes) == 0,
-        "freeze_count": len(freezes),
-        "freeze_starts": freezes
-    }
-    # Note: Freezes are noted in results
+    if freeze_proc.returncode != 0:
+        results["passed"] = False
+        results["errors"].append(f"Freeze detection command failed: {freeze_proc.stderr[-300:]}")
+        results["checks"]["freezes"] = {"passed": False, "error": freeze_proc.stderr[-300:]}
+    else:
+        freezes = re.findall(r"freeze_start:\s+([-\d\.]+)", freeze_proc.stderr)
+        freeze_pass = len(freezes) == 0
+        results["checks"]["freezes"] = {
+            "passed": freeze_pass,
+            "freeze_count": len(freezes),
+            "freeze_starts": freezes
+        }
+        if not freeze_pass:
+            results["passed"] = False
+            results["errors"].append(f"Freeze check failed: detected {len(freezes)} frozen segment(s) > 1.5s")
 
     return results

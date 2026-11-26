@@ -1,9 +1,25 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+import asyncio
+import hashlib
 import json
+import os
 import re
+import time
+from pathlib import Path
+from pydantic import ValidationError
 from langchain_google_genai import ChatGoogleGenerativeAI
 from core.config import settings
+
+_VOICE_PRESETS_PATH = Path(__file__).resolve().parent / "voice_presets.json"
+
+def load_voice_presets_config() -> dict:
+    try:
+        if _VOICE_PRESETS_PATH.exists():
+            return json.loads(_VOICE_PRESETS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"role_overrides": [], "character_voice_presets": {}}
 
 def extract_text_content(content: Any) -> str:
     """Extract plain text from LLM response or stream chunk content, which may be str or list of dicts."""
@@ -35,10 +51,6 @@ class BaseLLMProvider(ABC):
     def get_structured_output(self, prompt: str, schema: Any, **kwargs) -> Any:
         pass
 
-
-import asyncio
-import time
-from pydantic import ValidationError
 
 DEFAULT_GEMINI_FALLBACKS = [
     "gemini-3.8-flash",
@@ -221,8 +233,6 @@ class PollinationsImageAdapter(BaseImageProvider):
         safe_params = [f"seed={seed}", "nologo=true"]
         if self.width and self.height:
             safe_params.append(f"width={self.width}&height={self.height}")
-        if key:
-            safe_params.append(f"key={key}")
         safe_query_str = "&".join(safe_params)
         safe_image_url = f"https://gen.pollinations.ai/image/{encoded_prompt}?{safe_query_str}"
         req_url = safe_image_url
@@ -508,13 +518,6 @@ class EdgeTTSAudioAdapter(BaseAudioProvider):
             resolved_voice = self.VOICESTUDIO_OR_CUSTOM_MAP[resolved_voice.lower()]
         elif "Neural" not in resolved_voice:
             resolved_voice = "en-US-ChristopherNeural"
-
-        if pitch == "+0Hz" and rate == "+0%":
-            for preset in self.VOICE_PRESETS.values():
-                if preset["voice"] == resolved_voice and (preset.get("pitch") != "+0Hz" or preset.get("rate") != "+0%"):
-                    pitch = preset["pitch"]
-                    rate = preset["rate"]
-                    break
         try:
             comm = edge_tts.Communicate(clean_text, resolved_voice, pitch=pitch, rate=rate)
             chunks = []
@@ -559,43 +562,14 @@ class EdgeTTSAudioAdapter(BaseAudioProvider):
             elif re.search(male_pattern, desc_lower):
                 is_female = False
 
-        # 2. Match specific iconic anime & cartoon characters
-        if "appu" in name_lower or "elephant" in name_lower:
-            return {
-                "voice": "en-US-AnaNeural",
-                "pitch": "+16Hz",
-                "rate": "+6%",
-                "label": "Appu (Baby Elephant)",
-                "gender": "male"
-            }
-        elif "chintu" in name_lower or "tiger" in name_lower or "cub" in name_lower:
-            return {
-                "voice": "en-US-EricNeural",
-                "pitch": "+12Hz",
-                "rate": "+10%",
-                "label": "Chintu (Tiger Cub)",
-                "gender": "male"
-            }
-        elif "doraemon" in name_lower:
-            return self.VOICE_PRESETS["doraemon"]
-        elif "nobita" in name_lower:
-            return self.VOICE_PRESETS["nobita"]
-        elif "shizuka" in name_lower:
-            return self.VOICE_PRESETS["anime_shizuka"]
-        elif "gian" in name_lower or "takeshi" in name_lower:
-            return self.VOICE_PRESETS["anime_gian"]
-        elif "suneo" in name_lower:
-            return self.VOICE_PRESETS["anime_suneo"]
-        elif "solaris" in name_lower:
-            return self.VOICE_PRESETS["male_hero"]
-        elif "malakor" in name_lower:
-            return self.VOICE_PRESETS["male_villain"]
-        elif "shadow" in name_lower or "weaver" in name_lower:
-            return self.VOICE_PRESETS["female_mystic"]
-        elif "titaness" in name_lower:
-            return self.VOICE_PRESETS["female_warrior"]
-        elif "aero" in name_lower:
-            return self.VOICE_PRESETS["male_speed"]
+        # 2. Match configured character voice presets from voice_presets.json
+        presets_cfg = load_voice_presets_config().get("character_voice_presets", {})
+        for key, cfg in presets_cfg.items():
+            if key in name_lower:
+                if "preset" in cfg and cfg["preset"] in self.VOICE_PRESETS:
+                    return self.VOICE_PRESETS[cfg["preset"]]
+                if "voice" in cfg:
+                    return dict(cfg)
 
         # 3. Match cartoon mascot / robotic cat traits
         if any(w in desc_lower for w in ["robot cat", "mascot", "earless", "robotic cat", "cartoon cat"]):
@@ -647,7 +621,7 @@ class EdgeTTSAudioAdapter(BaseAudioProvider):
 class ElevenLabsAudioAdapter(BaseAudioProvider):
     """Studio-grade voiceover provider powered by ElevenLabs with automatic fallback to EdgeTTS."""
 
-    _api_key_valid: bool | None = None
+    _invalid_key_hashes: set[str] = set()
 
     VOICE_PRESETS = {
         # Narrative & Dramatic
@@ -696,6 +670,10 @@ class ElevenLabsAudioAdapter(BaseAudioProvider):
         self.model_id = model_id
         self._fallback_provider = EdgeTTSAudioAdapter()
 
+    @staticmethod
+    def _key_hash(api_key: str) -> str:
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
     async def generate_speech(self, text: str, voice_id: str = "pNInz6obpgDQGcFmaJgB", pitch: str = "+0Hz", rate: str = "+0%") -> str:
         import httpx
         import base64
@@ -704,7 +682,8 @@ class ElevenLabsAudioAdapter(BaseAudioProvider):
         if not clean_text:
             return ""
 
-        if ElevenLabsAudioAdapter._api_key_valid is False or not self.api_key:
+        key_hash = self._key_hash(self.api_key) if self.api_key else ""
+        if not self.api_key or key_hash in ElevenLabsAudioAdapter._invalid_key_hashes:
             return await self._fallback_provider.generate_speech(text, voice_id=voice_id, pitch=pitch, rate=rate)
 
         # Map EdgeTTS voice names if passed
@@ -734,12 +713,12 @@ class ElevenLabsAudioAdapter(BaseAudioProvider):
             async with httpx.AsyncClient(timeout=45.0) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 if resp.status_code == 200:
-                    ElevenLabsAudioAdapter._api_key_valid = True
+                    ElevenLabsAudioAdapter._invalid_key_hashes.discard(key_hash)
                     b64_audio = base64.b64encode(resp.content).decode("utf-8")
                     return f"data:audio/mp3;base64,{b64_audio}"
                 else:
                     if resp.status_code in (401, 403):
-                        ElevenLabsAudioAdapter._api_key_valid = False
+                        ElevenLabsAudioAdapter._invalid_key_hashes.add(key_hash)
                     print(f"[ElevenLabsAudioAdapter] API returned {resp.status_code}: {resp.text[:120]}. Falling back to EdgeTTS.")
         except Exception as e:
             print(f"[ElevenLabsAudioAdapter] Network or generation error: {e}. Falling back to EdgeTTS.")
@@ -817,8 +796,9 @@ class VoiceStudioAudioAdapter(BaseAudioProvider):
     def __init__(self, api_url: str = ""):
         self.api_url = (api_url or getattr(settings, "VOICESTUDIO_API_URL", "http://localhost:8080/v1")).rstrip("/")
         self._fallback_provider = EdgeTTSAudioAdapter()
+        self._voice_fallbacks: dict[str, str] = {}
 
-    async def generate_speech(self, text: str, voice_id: str = "default", pitch: str = "+0Hz", rate: str = "+0%", prompt: str = "") -> str:
+    async def generate_speech(self, text: str, voice_id: str = "default", pitch: str = "+0Hz", rate: str = "+0%", prompt: str = "", fallback_voice: str = "") -> str:
         import httpx
         import base64
 
@@ -846,22 +826,20 @@ class VoiceStudioAudioAdapter(BaseAudioProvider):
         except Exception as e:
             print(f"[VoiceStudio] Local instance unreachable at {self.api_url} ({e}). Falling back to EdgeTTS.")
 
-        return await self._fallback_provider.generate_speech(text, voice_id=voice_id, pitch=pitch, rate=rate)
+        edge_voice = fallback_voice or self._voice_fallbacks.get(voice_id.lower().strip(), "") or voice_id
+        return await self._fallback_provider.generate_speech(text, voice_id=edge_voice, pitch=pitch, rate=rate)
 
     def match_character_voice(self, char_name: str, char_role: str = "", description: str = "", gender: str = "") -> dict:
         name_lower = char_name.lower().strip()
-        if "appu" in name_lower or "elephant" in name_lower:
-            prompt = "A squeaky, cheerful 4-year-old baby elephant with playful giggles and warm tone"
-            fallback = {"voice": "en-US-AnaNeural", "pitch": "+16Hz", "rate": "+6%", "label": "Appu (VoiceStudio / Baby Elephant)", "gender": "male"}
-        elif "chintu" in name_lower or "tiger" in name_lower:
-            prompt = "An energetic, feisty baby tiger cub with a raspy laugh and high-pitched excitement"
-            fallback = {"voice": "en-US-EricNeural", "pitch": "+12Hz", "rate": "+10%", "label": "Chintu (VoiceStudio / Tiger Cub)", "gender": "male"}
-        else:
-            prompt = f"Expressive voice for {char_name}: {char_role}, {description}"
-            fallback = self._fallback_provider.match_character_voice(char_name, char_role, description, gender)
+        voice_key = name_lower.replace(" ", "_")
+        prompt = f"Expressive voice for {char_name}: {char_role}, {description}".strip()
+        fallback = self._fallback_provider.match_character_voice(char_name, char_role, description, gender)
+        fallback_voice = fallback.get("voice", "en-US-ChristopherNeural")
+        self._voice_fallbacks[voice_key] = fallback_voice
 
         return {
-            "voice": name_lower.replace(" ", "_"),
+            "voice": voice_key,
+            "fallback_voice": fallback_voice,
             "voice_prompt": prompt,
             "label": fallback.get("label", char_name),
             "gender": fallback.get("gender", "male"),
