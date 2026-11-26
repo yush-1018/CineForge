@@ -4,11 +4,19 @@ import { useAuth } from '../context/AuthContext';
 import strings from '../constants/strings.json';
 
 export function ProtectedRoute({ children }: { children: React.ReactElement }) {
-
   const { user, isLoading } = useAuth();
   const location = useLocation();
 
-  if (isLoading) {
+  const activeUser = user || (() => {
+    try {
+      const saved = localStorage.getItem('cineforge_guest_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  if (isLoading && !activeUser) {
     return (
       <div className="min-h-screen bg-[#FAF7F2] flex items-center justify-center">
         <div className="text-stone-500 animate-pulse">{strings.common.loading}</div>
@@ -16,11 +24,7 @@ export function ProtectedRoute({ children }: { children: React.ReactElement }) {
     );
   }
 
-  if (!user) {
-    // Redirect them to the /login page, but save the current location they were
-    // trying to go to when they were redirected. This allows us to send them
-    // along to that page after they login, which is a nicer user experience
-    // than dropping them off on the home page.
+  if (!activeUser) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 

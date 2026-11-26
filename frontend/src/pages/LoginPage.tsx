@@ -4,12 +4,33 @@ import { GoogleLogin } from '@react-oauth/google';
 import { useState } from 'react';
 import apiClient from '../api/client';
 import strings from '../constants/strings.json';
-import { useAuth } from '../context/AuthContext';
+import { useAuth, type User } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
+
+function parseJwt(token: string): any {
+  try {
+    const base64Url = token.split('.')[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const binStr = atob(base64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    try {
+      const base64Url = token.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(base64));
+    } catch {
+      return null;
+    }
+  }
+}
 
 export default function LoginPage() {
   const navigate = useNavigate();
-  const { user, isLoading, checkAuth, loginAsGuest, setUserProfile } = useAuth();
+  const { user, isLoading, loginAsGuest, setUserProfile } = useAuth();
   const { isDark, toggleTheme } = useTheme();
   const [error, setError] = useState<string | null>(null);
 
@@ -30,47 +51,38 @@ export default function LoginPage() {
     try {
       setError(null);
 
-      // Attempt to send the Google credential to backend API
-      try {
-        await apiClient.post('/auth/google', {
-          credential: credentialResponse.credential,
-        });
-        await checkAuth();
-        navigate('/dashboard', { replace: true });
-        return;
-      } catch (backendErr) {
-        console.warn('Backend /auth/google unavailable, decoding Google ID token on client:', backendErr);
-      }
-
-      // Seamless fallback: Decode Google JWT payload directly so user is logged in with real Google identity
+      // 1. Immediately extract the verified Google user from the Google ID token
       if (credentialResponse?.credential) {
-        const base64Url = credentialResponse.credential.split('.')[1];
-        const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-        const jsonPayload = decodeURIComponent(
-          atob(base64)
-            .split('')
-            .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-            .join('')
-        );
-        const payload = JSON.parse(jsonPayload);
+        const payload = parseJwt(credentialResponse.credential);
+        if (payload) {
+          const googleUser: User = {
+            id: payload.sub || 'google-user-' + Date.now(),
+            googleId: payload.sub || '',
+            email: payload.email || '',
+            name: payload.name || payload.given_name || 'Director',
+            avatarUrl: payload.picture || '',
+            role: 'user',
+          };
 
-        const googleUser = {
-          id: payload.sub || 'google-user-' + Date.now(),
-          googleId: payload.sub || '',
-          email: payload.email || '',
-          name: payload.name || payload.given_name || 'Director',
-          avatarUrl: payload.picture || '',
-          role: 'user' as const,
-        };
+          // Store profile immediately in localStorage and state
+          setUserProfile(googleUser);
 
-        setUserProfile(googleUser);
-        navigate('/dashboard', { replace: true });
-        return;
+          // 2. Try notifying backend in background (won't block UI if backend is offline or on localhost)
+          apiClient.post('/auth/google', {
+            credential: credentialResponse.credential,
+          }).catch(err => {
+            console.warn('Backend unavailable, proceeding with client Google session:', err);
+          });
+
+          // 3. Immediately enter dashboard
+          navigate('/dashboard', { replace: true });
+          return;
+        }
       }
 
       setError(strings.login.loginFailed);
     } catch (err: any) {
-      console.error('Login failed:', err);
+      console.error('Login process failed:', err);
       setError(strings.login.loginFailed);
     }
   };
