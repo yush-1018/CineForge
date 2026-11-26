@@ -16,6 +16,7 @@ interface AuthContextType {
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
   loginAsGuest: () => void;
+  setUserProfile: (user: User) => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -26,18 +27,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const checkAuth = async () => {
     try {
-      const savedGuest = localStorage.getItem('cineforge_guest_user');
-      if (savedGuest) {
-        setUser(JSON.parse(savedGuest));
+      const savedUser = localStorage.getItem('cineforge_guest_user');
+      if (savedUser) {
+        setUser(JSON.parse(savedUser));
         setIsLoading(false);
         return;
       }
       const response = await apiClient.get('/auth/me');
       setUser(response.data.user);
     } catch (error) {
-      const savedGuest = localStorage.getItem('cineforge_guest_user');
-      if (savedGuest) {
-        setUser(JSON.parse(savedGuest));
+      const savedUser = localStorage.getItem('cineforge_guest_user');
+      if (savedUser) {
+        setUser(JSON.parse(savedUser));
       } else {
         setUser(null);
       }
@@ -63,6 +64,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(guestUser);
   };
 
+  const setUserProfile = (u: User) => {
+    localStorage.setItem('cineforge_guest_user', JSON.stringify(u));
+    setUser(u);
+  };
+
   const logout = async () => {
     localStorage.removeItem('cineforge_guest_user');
     try {
@@ -75,7 +81,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, logout, checkAuth, loginAsGuest }}>
+    <AuthContext.Provider value={{ user, isLoading, logout, checkAuth, loginAsGuest, setUserProfile }}>
       {children}
     </AuthContext.Provider>
   );
