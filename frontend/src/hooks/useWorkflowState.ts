@@ -50,6 +50,7 @@ export interface WorkflowState {
   voiceovers?: Voiceover[];
   video_shots?: VideoShot[];
   final_video_url?: string;
+  final_film_url?: string;
   approval_states: {
     script_approved?: boolean;
     characters_approved?: boolean;
