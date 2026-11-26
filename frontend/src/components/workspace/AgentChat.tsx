@@ -119,7 +119,7 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
       setTimeout(() => {
         setIsLoading(false);
         if (stage === 'script' && currentState.script_data) {
-          currentState.script_data.scenes[0].setting = `Revised per Director note (${feedback || 'enhanced pacing'}): ` + currentState.script_data.scenes[0].setting;
+          currentState.script_data.global_narrative = `Revised per Director note (${feedback || 'enhanced pacing'}): ${currentState.script_data.global_narrative || ''}`;
         }
         try {
           localStorage.setItem(storageKey, JSON.stringify(currentState));
@@ -508,30 +508,27 @@ export function AgentChat({ project, workflowState, onFetchState, onSwitchTab }:
         const projectTitle = project?.title || userMessageContent;
         const stage1Workflow = {
           current_stage: 'script_agent',
+          script_version: 1,
           script_data: {
             title: projectTitle,
             genre: 'Cinematic Narrative',
-            scenes: [
+            global_narrative: `A cinematic ${selectedDuration}s narrative exploring "${userMessageContent}", crafted with atmospheric camera movement, character continuity, and synchronized dialogue.`,
+            shots: [
               {
-                scene_number: 1,
-                title: 'Act I: ' + projectTitle,
-                setting: 'Atmospheric scene tailored to: ' + userMessageContent,
-                shots: [
-                  {
-                    shot_id: 'shot_1',
-                    camera_movement: 'Cinematic slow push-in tracking shot',
-                    visual_prompt: userMessageContent + ', ultra cinematic 8K, photorealistic atmospheric haze',
-                    speaker: 'Narrator',
-                    dialogue: 'Every legend begins with a spark. This is the story of ' + projectTitle + '.'
-                  },
-                  {
-                    shot_id: 'shot_2',
-                    camera_movement: 'Low-angle heroic wide shot',
-                    visual_prompt: 'Hero standing against a dramatic backdrop in cinematic lighting',
-                    speaker: 'Solaris',
-                    dialogue: "There's no turning back now. We face what lies ahead."
-                  }
-                ]
+                shot_id: 'shot_1',
+                duration_seconds: 5,
+                camera_movement: 'Cinematic slow push-in tracking shot',
+                visual_description: `WIDE ESTABLISHING TRACKING SHOT — ${userMessageContent}. Ultra cinematic 8K, photorealistic atmospheric haze, volumetric lighting.`,
+                speaker: 'Narrator',
+                dialogue: `Every legend begins with a spark. This is the story of ${projectTitle}.`
+              },
+              {
+                shot_id: 'shot_2',
+                duration_seconds: 5,
+                camera_movement: 'Low-angle heroic wide shot',
+                visual_description: 'LOW-ANGLE HEROIC CLOSE-UP — Solaris stands resolute against a dramatic backdrop in volumetric amber lighting.',
+                speaker: 'Solaris',
+                dialogue: "There's no turning back now. We face what lies ahead."
               }
             ]
           },
